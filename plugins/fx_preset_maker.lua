@@ -8,6 +8,8 @@
 --                                               presets and the EFFECT MAKER layout
 --   Plugin "FX Preset Maker by pisukari" "LEFT"   direction buttons: LEFT RIGHT CENTEROUT
 --                                               DOWN UP DIAGDOWN DIAGUP
+--   Plugin "FX Preset Maker by pisukari" "REPAIR" re-links the button icons of an
+--                                               existing EFFECT MAKER screen
 --
 -- What it makes
 --   * 17 dimmer phaser presets (Dim Sinus / Chase / Snap Off / Snap On) in the empty
@@ -144,18 +146,111 @@ end
 
 local function q(s) return '"' .. s .. '"' end
 
--- load <file> from media/images into Image 3.<no>. The first Import of a file onPC has
--- not indexed yet can fail without creating the slot, so it is tried twice.
-local function loadImage(no, file)
-  for _ = 1, 2 do
-    Cmd('Import Image Library ' .. q(file) .. ' At Image 3.' .. no)   -- creates the slot
-    if exists("Image 3." .. no) then break end
+-- image files that could not be loaded (reported at the end)
+local MISSING = {}
+
+-- number of the image in the Images pool that holds <file>, or nil
+local function findImage(file)
+  local want = file:lower()
+  for _, im in ipairs(ShowData().MediaPools.Images:Children()) do
+    local fn = im:Get("FileName")
+    if fn and tostring(fn):lower() == want then return im.no end
   end
-  Cmd('Set Image 3.' .. no .. ' Property "FileName" ' .. q(file))     -- loads the file
-  local im = first("Image 3." .. no)
-  local ok = im and tostring(im:Get("FileName")) == file
-  if not ok then Printf("FX Preset Maker: image %s not found in media/images", file) end
-  return ok
+end
+
+-- load <file> from media/images and return the number it really landed on.
+-- An image already in the pool is reused. Import does not always use the requested
+-- number (grandMA3 2.4 puts it on the next free slot) and the very first import of a
+-- new file can fail, so the result is always looked up by file name, never assumed.
+local function loadImage(file)
+  local have = findImage(file)
+  if have then return have end
+  local no = 1
+  while exists("Image 3." .. no) and no < 1000 do no = no + 1 end
+  for _ = 1, 2 do
+    Cmd('Import Image Library ' .. q(file) .. ' At Image 3.' .. no)
+    local got = findImage(file)
+    if got then return got end
+    if exists("Image 3." .. no) then
+      Cmd('Set Image 3.' .. no .. ' Property "FileName" ' .. q(file))   -- empty slot: load into it
+      got = findImage(file)
+      if got then return got end
+    end
+  end
+  MISSING[#MISSING + 1] = file
+  Printf("FX Preset Maker: image %s not found in media/images", file)
+end
+
+-- links that could not be made / verified (reported at the end)
+local LINKFAIL = {}
+
+-- name of a property value that is either an object or already its name
+local function nameOf(v)
+  if v == nil then return "" end
+  if type(v) == "string" then return v end
+  local ok, n = pcall(function() return v.name end)
+  return ok and n and tostring(n) or tostring(v)
+end
+
+local function nextFree(prefix)
+  local no = CFG.START
+  while exists(prefix .. no) and no < 9999 do no = no + 1 end
+  return no
+end
+
+-- appearance <appName> showing <file>. The appearance is reused when one with that name
+-- exists (wherever it is), otherwise stored on the next free number and found again by
+-- name. The image is looked up by file name. The link is read back. Returns its number.
+local function linkAppearance(appName, file)
+  local img = loadImage(file)
+  local app = first('Appearance ' .. q(appName))
+  if not app then
+    local no = nextFree("Appearance ")
+    Cmd('Store Appearance ' .. no .. ' ' .. q(appName))
+    app = first('Appearance ' .. q(appName)) or first('Appearance ' .. no)
+  end
+  if not app then
+    LINKFAIL[#LINKFAIL + 1] = appName
+    return nil
+  end
+  local no = app.no
+  Cmd('Set Appearance ' .. no .. ' Property "ImageMode" "Stretch" "BackAlpha" 0')
+  if img then
+    Cmd('Assign Image 3.' .. img .. ' At Appearance ' .. no)
+    local im, a = first('Image 3.' .. img), first('Appearance ' .. no)
+    if not (im and a and nameOf(a:Get("Image")) == tostring(im.name)) then
+      LINKFAIL[#LINKFAIL + 1] = appName
+    end
+  end
+  return no
+end
+
+-- give appearance number <appNo> to macro number <macNo>, read back
+local function linkMacro(macNo, appNo, label)
+  if not (macNo and appNo) then return end
+  Cmd('Assign Appearance ' .. appNo .. ' At Macro ' .. macNo)
+  local m, a = first('Macro ' .. macNo), first('Appearance ' .. appNo)
+  if not (m and a and nameOf(m:Get("Appearance")) == tostring(a.name)) then
+    LINKFAIL[#LINKFAIL + 1] = "Macro " .. label
+  end
+end
+
+-- text for the end message: images not found, links not made
+local function problems()
+  local s = ""
+  if #MISSING > 0 then
+    s = s .. "\n\nImages not found in media/images (" .. #MISSING .. "):\n" .. table.concat(MISSING, ", ")
+      .. "\nCopy them from the images folder of the zip, then run REPAIR."
+  end
+  if #LINKFAIL > 0 then
+    s = s .. "\n\nNot linked (" .. #LINKFAIL .. "): " .. table.concat(LINKFAIL, ", ")
+  end
+  return s
+end
+
+local function resetProblems()
+  for k in pairs(MISSING) do MISSING[k] = nil end
+  for k in pairs(LINKFAIL) do LINKFAIL[k] = nil end
 end
 
 -- the lowest `count` empty numbers of a pool, e.g. free("Macro ", 45)
@@ -189,12 +284,9 @@ local function build()
 
   -- 1. pick the lowest empty numbers
   local MAC = free("Macro ", n)
-  local APP = free("Appearance ", n)
-  local IMG = free("Image 3.", n, 1000)
   local LAY = free("Layout ", 2)
-  if #MAC < n or #APP < n or #IMG < n or #LAY < 1 then
-    msg(string.format("Stopped: not enough empty numbers (macros %d, appearances %d, images %d of %d)",
-           #MAC, #APP, #IMG, n))
+  if #MAC < n or #LAY < 1 then
+    msg(string.format("Stopped: not enough empty numbers (macros %d of %d)", #MAC, n))
     return
   end
   local L = LAY[1]
@@ -213,14 +305,10 @@ local function build()
   -- 2. images, appearances, macros
   for i, b in ipairs(BUTTONS) do
     local name, icon, lines = b[1], b[2], b[3]
-    local img, app, mac = IMG[i], APP[i], MAC[i]
+    local mac = MAC[i]
     if lines == "SAVE_FX" then lines = { saveFx } end
 
-    loadImage(img, icon)
-
-    Cmd('Store Appearance ' .. app .. ' ' .. q("FXM " .. name))
-    Cmd('Set Appearance ' .. app .. ' Property "ImageMode" "Stretch" "BackAlpha" 0')
-    Cmd('Assign Image 3.' .. img .. ' At Appearance ' .. app)
+    local app = linkAppearance("FXM " .. name, icon)
 
     Cmd('Store Macro ' .. mac .. ' ' .. q(name))
     local m = first("Macro " .. mac)
@@ -235,7 +323,7 @@ local function build()
     else
       Printf("FX Preset Maker: could not create Macro " .. mac)
     end
-    Cmd('Assign Appearance ' .. app .. ' At Macro ' .. mac)
+    linkMacro(mac, app, name)
   end
 
   -- 3. layout
@@ -269,8 +357,6 @@ local function build()
 
   Printf("EFFECT MAKER layout built: Layout %d (SAVE FX -> Layout %d)", L, R)
   Printf("  Macros %s", span(MAC))
-  Printf("  Appearances %s", span(APP))
-  Printf("  Images 3.%s", span(IMG))
   return lay
 end
 
@@ -301,28 +387,7 @@ local PRESETS = {
 }
 local PW, PH = 150, 100
 
-local function freeNo(prefix, max)
-  for no = CFG.START, max or 9999 do
-    if not exists(prefix .. no) then return no end
-  end
-end
 
--- appearance <name> showing <file>; created (with its image) when missing
-local function appearance(name, file)
-  if exists('Appearance ' .. q(name)) then return end
-  local img = nil
-  for _, im in ipairs(ShowData().MediaPools.Images:Children()) do
-    if im.filename == file or im.FileName == file then img = im.no; break end
-  end
-  if not img then
-    img = freeNo("Image 3.", 1000)
-    loadImage(img, file)
-  end
-  local app = freeNo("Appearance ")
-  Cmd('Store Appearance ' .. app .. ' ' .. q(name))
-  Cmd('Set Appearance ' .. app .. ' Property "ImageMode" "Stretch" "BackAlpha" 0')
-  Cmd('Assign Image 3.' .. img .. ' At Appearance ' .. app)
-end
 
 -- dimmer ui channels of all patched fixtures (selects them all first); {} when none
 local function selectDimmers()
@@ -465,9 +530,43 @@ local function direction(mode)
 end
 
 ----------------------------------------------------------------------------------------
+-- repair:  Plugin "FX Preset Maker by pisukari" "REPAIR"
+-- Re-links the button icons of an existing EFFECT MAKER screen: for every button macro
+-- it loads the icon (or finds it already in the Images pool by file name), puts it on
+-- the appearance "FXM <name>" (created when missing) and gives that appearance to the
+-- macro. The dimmer presets get their PFX / PFXM icons the same way. Layout, macros
+-- and presets are not changed otherwise.
+----------------------------------------------------------------------------------------
+local function repair()
+  resetProblems()
+  local done, nomacro = 0, {}
+  for _, b in ipairs(BUTTONS) do
+    local name, icon = b[1], b[2]
+    local mac = first('Macro ' .. q(name))
+    if not mac then
+      nomacro[#nomacro + 1] = name
+    else
+      local before = #LINKFAIL + #MISSING
+      linkMacro(mac.no, linkAppearance("FXM " .. name, icon), name)
+      if #LINKFAIL + #MISSING == before then done = done + 1 end
+    end
+  end
+  for _, p in ipairs(PRESETS) do
+    if first('Appearance ' .. q("PFX " .. p[1])) then linkAppearance("PFX " .. p[1], "fx_" .. p[1] .. ".png") end
+    if first('Appearance ' .. q("PFXM " .. p[1])) then linkAppearance("PFXM " .. p[1], "fxm_" .. p[1] .. ".png") end
+  end
+  local text = string.format("REPAIR done: %d of %d buttons linked.", done, #BUTTONS)
+  if #nomacro > 0 then
+    text = text .. "\nMacros not found (" .. #nomacro .. "): " .. table.concat(nomacro, ", ")
+  end
+  msg(text .. problems())
+end
+
+----------------------------------------------------------------------------------------
 -- presets + layout
 ----------------------------------------------------------------------------------------
 local function maker()
+  resetProblems()
   -- 1. ask the pool
   local P = askPool()
   if not P then Printf("FX Preset Maker: canceled") return end
@@ -504,8 +603,8 @@ local function maker()
 
   -- 3. pool icons
   for i, p in ipairs(PRESETS) do
-    appearance("PFX " .. p[1], "fx_" .. p[1] .. ".png")
-    appearance("PFXM " .. p[1], "fxm_" .. p[1] .. ".png")
+    linkAppearance("PFX " .. p[1], "fx_" .. p[1] .. ".png")
+    linkAppearance("PFXM " .. p[1], "fxm_" .. p[1] .. ".png")
     if nos[i] then
       local pr = first("Preset " .. P .. "." .. nos[i])
       if pr and (pr.appearance == nil or tostring(pr.appearance) == "") then
@@ -566,6 +665,7 @@ local function maker()
   end
 
   local note = noFixtures and "\nNo fixture with a Dimmer is patched: patch fixtures, then run this plugin again." or ""
+  note = note .. problems()
   msg(string.format("All %d (pool %d): %d presets created, %d placed.\nLayout %d %s%s%s",
       P - 20, P, made, placed, L, tostring(lay.name), built and " (new)" or "", note))
 end
@@ -573,6 +673,7 @@ end
 local function main(display, arg)
   local mode = tostring(arg or ""):upper():gsub("%s", "")
   if MODES[mode] then return direction(mode) end
+  if mode == "REPAIR" then return repair() end
   return maker()
 end
 

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <GMA3 DataVersion="0.8.84.0">
-    <UserPlugin Name="FX Preset Maker by pisukari" Author="pisukari" Version="2.3.1">
+    <UserPlugin Name="FX Preset Maker by pisukari" Author="pisukari" Version="4.0.0">
         <ComponentLua Name="fx_preset_maker" FileName="fx_preset_maker.lua" />
     </UserPlugin>
 </GMA3>
